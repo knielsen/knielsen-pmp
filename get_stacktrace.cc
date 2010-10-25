@@ -10,14 +10,15 @@
 #include <string.h>
 
 #include <set>
+#include <map>
 using namespace std;
 
 #include <libunwind.h>
 #include <libunwind-ptrace.h>
 
-set<int> seen_tids;
+static set<int> seen_tids;
 
-int
+static int
 ptrace_all_threads(int pid)
 {
   DIR *dir= NULL;
@@ -107,7 +108,7 @@ err_exit:
   return ret;
 }
 
-void
+static void
 puntrace_all()
 {
   for (set<int>::iterator it= seen_tids.begin(); it != seen_tids.end(); it++)
@@ -119,7 +120,7 @@ puntrace_all()
   }
 }
 
-void
+static void
 do_the_backtrace(int pid, unw_addr_space_t addr_space)
 {
   void *upt_info= NULL;
@@ -145,7 +146,7 @@ do_the_backtrace(int pid, unw_addr_space_t addr_space)
     unw_word_t offp;
     char buf[1024];
     strcpy(buf, "");
-    unw_get_proc_name(&cursor, buf, sizeof(buf), &offp);
+//     unw_get_proc_name(&cursor, buf, sizeof(buf), &offp);
     unw_get_reg(&cursor, UNW_REG_IP, &ip);
     printf("ip = %lx <%s>+%d\n", (long) ip, buf, (long)offp);
   } while (unw_step(&cursor) > 0);
@@ -155,11 +156,45 @@ err_exit:
     _UPT_destroy(upt_info);
 }
 
+static int (*orig_access_mem)(unw_addr_space_t, unw_word_t, unw_word_t *,
+                              int, void *);
+/*
+  The default ptrace-based access_mem callback in libunwind just invokes
+  ptrace(PTRACE_PEEKDATA, ...). We can save a lot of system calls just by
+  caching repeated reads.
+*/
+static map<unw_word_t, unw_word_t> cached_reads;
+
+static int
+my_access_mem(unw_addr_space_t as, unw_word_t addr, unw_word_t *valp,
+              int write, void *arg)
+{
+  if (!write)
+  {
+    const map<unw_word_t, unw_word_t>::iterator it= cached_reads.find(addr);
+    if (it != cached_reads.end())
+    {
+      *valp= it->second;
+      return 0;
+    }
+    else
+    {
+      int err= (*orig_access_mem)(as, addr, valp, write, arg);
+      if (!err)
+        cached_reads.insert(pair<unw_word_t, unw_word_t>(addr,*valp));
+      return err;
+    }
+  }
+
+  return (*orig_access_mem)(as, addr, valp, write, arg);
+}
+
 int
 main(int argc, char *argv[])
 {
   unw_addr_space_t addr_space= NULL;
   int pid, err;
+  unw_accessors_t my_accessors;
 
   if (argc != 2)
   {
@@ -167,7 +202,10 @@ main(int argc, char *argv[])
     exit(1);
   }
 
-  addr_space= unw_create_addr_space(&_UPT_accessors, 0);
+  memcpy(&my_accessors, &_UPT_accessors, sizeof(my_accessors));
+  orig_access_mem= my_accessors.access_mem;
+  my_accessors.access_mem= my_access_mem;
+  addr_space= unw_create_addr_space(&my_accessors, 0);
   if (!addr_space)
   {
     fprintf(stderr, "unw_create_addr_space() failed.\n");
