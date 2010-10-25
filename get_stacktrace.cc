@@ -120,18 +120,11 @@ puntrace_all()
 }
 
 void
-do_the_backtrace(int pid)
+do_the_backtrace(int pid, unw_addr_space_t addr_space)
 {
-  unw_addr_space_t addr_space= NULL;
   void *upt_info= NULL;
   int err;
 
-  addr_space= unw_create_addr_space(&_UPT_accessors, 0);
-  if (!addr_space)
-  {
-    fprintf(stderr, "unw_create_addr_space() failed.\n");
-    goto err_exit;
-  }
   upt_info= _UPT_create(pid);
   if (!upt_info)
   {
@@ -148,45 +141,56 @@ do_the_backtrace(int pid)
 
   do
   {
-    unw_word_t ip, sp;
+    unw_word_t ip= 0;
     unw_word_t offp;
     char buf[1024];
     strcpy(buf, "");
     unw_get_proc_name(&cursor, buf, sizeof(buf), &offp);
     unw_get_reg(&cursor, UNW_REG_IP, &ip);
-    unw_get_reg(&cursor, UNW_REG_SP, &sp);
-    printf("ip = %lx, sp = %lx <%s>+%d\n", (long) ip, (long) sp, buf, (long)offp);
+    printf("ip = %lx <%s>+%d\n", (long) ip, buf, (long)offp);
   } while (unw_step(&cursor) > 0);
 
 err_exit:
   if (upt_info)
     _UPT_destroy(upt_info);
-  if (addr_space)
-    unw_destroy_addr_space(addr_space);
 }
 
 int
 main(int argc, char *argv[])
 {
+  unw_addr_space_t addr_space= NULL;
+  int pid, err;
+
   if (argc != 2)
   {
     fprintf(stderr, "Usage: %s <pid>\n", argv[0]);
     exit(1);
   }
 
-  int pid= atoi(argv[1]);
+  addr_space= unw_create_addr_space(&_UPT_accessors, 0);
+  if (!addr_space)
+  {
+    fprintf(stderr, "unw_create_addr_space() failed.\n");
+    goto err_exit;
+  }
 
-  int err= ptrace_all_threads(pid);
+  pid= atoi(argv[1]);
+
+  err= ptrace_all_threads(pid);
   if (!err)
   {
     for (set<int>::iterator it= seen_tids.begin(); it != seen_tids.end(); it++)
     {
       printf("\nThread: %d\n", *it);
-      do_the_backtrace(*it);
+      do_the_backtrace(*it, addr_space);
     }
   }
 
   puntrace_all();
+
+err_exit:
+  if (addr_space)
+    unw_destroy_addr_space(addr_space);
 
   return 0;
 }

@@ -1,0 +1,10 @@
+*~
+*.o
+include
+lib
+libunwind
+share
+test1
+get_stacktrace
+test_proc_mem
+test_link_error
