@@ -143,7 +143,7 @@ do_the_backtrace(int pid, unw_addr_space_t addr_space)
   do
   {
     unw_word_t ip= 0;
-    unw_word_t offp;
+    unw_word_t offp= 0;
     char buf[1024];
     strcpy(buf, "");
 //     unw_get_proc_name(&cursor, buf, sizeof(buf), &offp);
