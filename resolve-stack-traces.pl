@@ -4,13 +4,20 @@ use strict;
 # Silence annoying warnings about non-portable 64-bit hex(); alternative is to use Math::BigInt
 #use warnings;
 
+my $opt_gdb_compat= 0;
+
 my $mmap;
 
 sub load_mapping {
   my ($pid)= @_;
 
-  open F, '<', "/proc/$pid/maps"
-      or die "Failed to open /proc/$pid/maps: $!\n";
+  if ($pid =~ /^[0-9]+$/) {
+    open F, '<', "/proc/$pid/maps"
+        or die "Failed to open /proc/$pid/maps: $!\n";
+  } else {
+    open F, '<', $pid
+        or die "Failed to open saved map file '$pid': $!\n";
+  }
 
   my $arr= [];
   while (<F>) {
@@ -84,13 +91,27 @@ sub resolve_addr {
     my $func_start= $s->[$low][0];
     my $func_name= $s->[$low][1];
     my $func_into= $rel_addr - $func_start;
-    return "<$func_name+$func_into> ($image)";
+    if ($opt_gdb_compat) {
+      return sprintf("0x%x in %s (...) from %s", $addr, $func_name, $image);
+    } else {
+      return "<$func_name+$func_into> ($image)";
+    }
   }
 
-  return sprintf("0x%x", $addr);
+  if ($opt_gdb_compat) {
+    return sprintf("0x%s in ?? (...) from ??", $addr);
+  } else {
+    return sprintf("0x%x", $addr);
+  }
 }
 
-die "Usage: $0 <pid>"
+if (@ARGV > 0 && $ARGV[0] eq '-g')
+{
+  $opt_gdb_compat= 1;
+  shift @ARGV;
+}
+
+die "Usage: $0 [-g] <pid>"
     unless @ARGV == 1;
 
 my $pid= $ARGV[0];
@@ -106,8 +127,12 @@ open PIP, "<&STDIN" or die "open(): $!";
 my @lines= <PIP>;
 close(PIP);
 
+my $frame_no= 0;
 for my $line (@lines) {
+  $frame_no= 0 if $line =~ /^Thread: [0-9]+/;
   if ($line =~ /^ip = ([a-f0-9]+) <>\+0$/) {
+    print "#", ++$frame_no, " "
+        if ($opt_gdb_compat);
     print resolve_addr(hex($1)), "\n";
   } else {
     print $line;
