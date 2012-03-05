@@ -4,10 +4,13 @@
 #include <stdlib.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <dirent.h>
 #include <errno.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <set>
 #include <map>
@@ -16,6 +19,9 @@ using namespace std;
 
 #include <libunwind.h>
 #include <libunwind-ptrace.h>
+
+#define READ_PAGE_SIZE 4096
+#define READ_PAGE_SIZE_MASK ~((unw_word_t)4096-1)
 
 static set<int> seen_tids;
 
@@ -172,31 +178,53 @@ static int (*orig_access_mem)(unw_addr_space_t, unw_word_t, unw_word_t *,
   The default ptrace-based access_mem callback in libunwind just invokes
   ptrace(PTRACE_PEEKDATA, ...). We can save a lot of system calls just by
   caching repeated reads.
+  Additionally, rather than using ptrace, we read a whole page at a time
+  from /proc/<pid>/mem, thus allowing to get more values with a single
+  syscall; this should save some time also as long as reads tend to be
+  somewhat clustered.
 */
-static map<unw_word_t, unw_word_t> cached_reads;
+static map<unw_word_t, unsigned char *> cached_reads;
+static int proc_pid_mem_fd = -1;
 
 static int
 my_access_mem(unw_addr_space_t as, unw_word_t addr, unw_word_t *valp,
               int write, void *arg)
 {
-  if (!write)
+  if (write)
+    return (*orig_access_mem)(as, addr, valp, write, arg);
+
+  unw_word_t base_addr= addr & READ_PAGE_SIZE_MASK;
+  const map<unw_word_t, unsigned char *>::iterator it=
+    cached_reads.find(base_addr);
+  if (it != cached_reads.end())
   {
-    const map<unw_word_t, unw_word_t>::iterator it= cached_reads.find(addr);
-    if (it != cached_reads.end())
-    {
-      *valp= it->second;
-      return 0;
-    }
-    else
-    {
-      int err= (*orig_access_mem)(as, addr, valp, write, arg);
-      if (!err)
-        cached_reads.insert(pair<unw_word_t, unw_word_t>(addr,*valp));
-      return err;
-    }
+    /* Found! */
+    memcpy(valp, it->second+(addr-base_addr), sizeof(*valp));
+    //fprintf(stderr, "my_access_mem() CACHED 0x%lx -> 0x%lx\n", addr, valp);
+    return 0;
   }
 
-  return (*orig_access_mem)(as, addr, valp, write, arg);
+  unsigned char *page = new unsigned char[READ_PAGE_SIZE];
+  if (!page)
+    return UNW_ENOMEM;
+  ssize_t res = pread(proc_pid_mem_fd, page, READ_PAGE_SIZE, base_addr);
+  if (res != READ_PAGE_SIZE)
+  {
+    if (res < 0)
+      fprintf(stderr, "Error reading from target process memory: %d: %s\n",
+              errno, strerror(errno));
+    else
+      fprintf(stderr, "Short read reading from target process memory: "
+              "asked for %u bytes but got %u\n", READ_PAGE_SIZE,
+              (unsigned)res);
+    delete[] page;
+    return UNW_EUNSPEC;
+  }
+
+  cached_reads.insert(pair<unw_word_t, unsigned char *>(base_addr, page));
+  memcpy(valp, page+(addr-base_addr), sizeof(*valp));
+  //fprintf(stderr, "my_access_mem() NEW 0x%lx -> 0x%lx\n", addr, valp);
+  return 0;
 }
 
 int
@@ -223,6 +251,14 @@ main(int argc, char *argv[])
   }
 
   pid= atoi(argv[1]);
+  char buf[30];
+  sprintf(buf, "/proc/%d/mem", pid);
+  proc_pid_mem_fd = open(buf, O_RDONLY, 0);
+  if (proc_pid_mem_fd < 0)
+  {
+    fprintf(stderr, "Failed to open %s: %d: %s\n", buf, errno, strerror(errno));
+    goto err_exit;
+  }
 
   err= ptrace_all_threads(pid);
   if (!err)
@@ -237,6 +273,8 @@ main(int argc, char *argv[])
   puntrace_all();
 
 err_exit:
+  if (proc_pid_mem_fd >= 0)
+    close(proc_pid_mem_fd);
   if (addr_space)
     unw_destroy_addr_space(addr_space);
 
