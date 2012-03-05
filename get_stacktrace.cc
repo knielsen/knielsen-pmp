@@ -11,6 +11,7 @@
 
 #include <set>
 #include <map>
+#include <vector>
 using namespace std;
 
 #include <libunwind.h>
@@ -120,6 +121,7 @@ puntrace_all()
   }
 }
 
+static vector<unw_word_t> backtrace;
 static void
 do_the_backtrace(int pid, unw_addr_space_t addr_space)
 {
@@ -140,16 +142,24 @@ do_the_backtrace(int pid, unw_addr_space_t addr_space)
     goto err_exit;
   }
 
+  backtrace.clear();
   do
   {
     unw_word_t ip= 0;
-    unw_word_t offp= 0;
-    char buf[1024];
-    strcpy(buf, "");
-//     unw_get_proc_name(&cursor, buf, sizeof(buf), &offp);
     unw_get_reg(&cursor, UNW_REG_IP, &ip);
-    printf("ip = %lx <%s>+%d\n", (long) ip, buf, (long)offp);
+    backtrace.push_back(ip);
   } while (unw_step(&cursor) > 0);
+
+  for (vector<unw_word_t>::iterator it= backtrace.begin();
+       it != backtrace.end();
+       it++)
+  {
+    char buf[1024];
+    unw_word_t offp= 0;
+    strcpy(buf, "");    /* So we just print empty on error */
+    _UPT_get_proc_name(addr_space, *it, buf, sizeof(buf), &offp, upt_info);
+    printf("ip = %lx <%s>+%d\n", (long) *it, buf, (long)offp);
+  }
 
 err_exit:
   if (upt_info)
