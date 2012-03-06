@@ -128,9 +128,9 @@ puntrace_all()
   }
 }
 
-static vector<unw_word_t> backtrace;
 static void
-do_the_backtrace(int pid, unw_addr_space_t addr_space, void *upt_info)
+do_the_backtrace(unw_addr_space_t addr_space, void *upt_info,
+                 vector<unw_word_t> *backtrace)
 {
   int err;
 
@@ -142,24 +142,13 @@ do_the_backtrace(int pid, unw_addr_space_t addr_space, void *upt_info)
     return;
   }
 
-  backtrace.clear();
+  backtrace->clear();
   do
   {
     unw_word_t ip= 0;
     unw_get_reg(&cursor, UNW_REG_IP, &ip);
-    backtrace.push_back(ip);
+    backtrace->push_back(ip);
   } while (unw_step(&cursor) > 0);
-
-  for (vector<unw_word_t>::iterator it= backtrace.begin();
-       it != backtrace.end();
-       ++it)
-  {
-    char buf[1024];
-    unw_word_t offp= 0;
-    strcpy(buf, "");    /* So we just print empty on error */
-    _UPT_get_proc_name(addr_space, *it, buf, sizeof(buf), &offp, upt_info);
-    printf("ip = %lx <%s>+%d\n", (long) *it, buf, (long)offp);
-  }
 }
 
 /*
@@ -300,6 +289,12 @@ clear_all_maps()
   }
 }
 
+struct thread_info {
+  void * upt_info;
+  vector<unw_word_t> backtrace;
+};
+static map<int, thread_info> thread_infos;
+
 int
 main(int argc, char *argv[])
 {
@@ -307,6 +302,7 @@ main(int argc, char *argv[])
   int pid, err;
   unw_accessors_t my_accessors;
   void *upt_info= NULL;
+  struct thread_info new_entry;
 
   if (argc != 2)
   {
@@ -336,31 +332,101 @@ main(int argc, char *argv[])
 
   find_readonly_maps(pid);
 
-  upt_info= _UPT_create(pid);
-  if (!upt_info)
+  for (int i= 0; i < 10; ++i)
   {
-    fprintf(stderr, "_UPT_create(%d) failed.\n", pid);
-    goto err_exit;
-  }
+    map<int, thread_info> prev_infos= thread_infos;
+    thread_infos.clear();
 
-  err= ptrace_all_threads(pid);
-  if (!err)
-  {
+    /*
+      Now ptrace() all threads of the target process, and obtain a backtrace
+      from each of them.
+      Do the minimum necessary here, to stall the target process as little as
+      possible, and defer as much as possible to afterwards.
+    */
+
+    err= ptrace_all_threads(pid);
+    if (err)
+    {
+      puntrace_all();
+      goto err_exit;
+    }
     for (set<int>::iterator it= seen_tids.begin();
          it != seen_tids.end();
          ++it)
     {
-      printf("\nThread: %d\n", *it);
-      do_the_backtrace(*it, addr_space, upt_info);
-    }
-  }
-  puntrace_all();
+      int pid= *it;
 
-  clear_non_read_only_maps();
+      map<int, thread_info>::iterator thr;
+      const map<int, thread_info>::iterator old= prev_infos.find(pid);
+      if (old == prev_infos.end())
+      {
+        /* First time thread seen - create a new entry. */
+        thr= thread_infos.insert(pair<int, thread_info>(pid, new_entry)).first;
+        thr->second.upt_info= _UPT_create(pid);
+        if (!thr->second.upt_info)
+        {
+          fprintf(stderr, "_UPT_create(%d) failed.\n", pid);
+          puntrace_all();
+          goto err_exit;
+        }
+      }
+      else
+      {
+        /* Re-use the old entry for this thread. */
+        thr= thread_infos.insert(pair<int, thread_info>(pid, old->second)).first;
+        prev_infos.erase(old);
+      }
+      do_the_backtrace(addr_space, thr->second.upt_info, &thr->second.backtrace);
+    }
+
+    puntrace_all();
+
+    /* Now target process is release; do rest of processing. */
+
+    /* Free info for any threads no longer present. */
+    for (map<int, thread_info>::iterator it= prev_infos.begin();
+         it != prev_infos.end();
+         ++it)
+    {
+      _UPT_destroy(it->second.upt_info);
+    }
+    prev_infos.clear();
+
+    /* Now resolve symbols and print each backtrace. */
+    /* ToDo: cache symbol lookups. */
+    for (map<int, thread_info>::iterator it= thread_infos.begin();
+         it != thread_infos.end();
+         ++it)
+    {
+      printf("\nThread: %d\n", it->first);
+      for (vector<unw_word_t>::iterator frame= it->second.backtrace.begin();
+           frame != it->second.backtrace.end();
+           ++frame)
+      {
+        char buf[1024];
+        unw_word_t offp= 0;
+        strcpy(buf, "");    /* So we just print empty on error */
+        _UPT_get_proc_name(addr_space, *frame, buf, sizeof(buf), &offp,
+                           it->second.upt_info);
+        printf("ip = %lx <%s>+%d\n", (long) *frame, buf, (long)offp);
+      }
+    }
+
+    /*
+      Drop from cache any reads from non-read-only maps, as they may well change
+      before the next stack traces.
+    */
+    clear_non_read_only_maps();
+  }
 
 err_exit:
-  if (upt_info)
-    _UPT_destroy(upt_info);
+  for (map<int, thread_info>::iterator it= thread_infos.begin();
+       it != thread_infos.end();
+       ++it)
+  {
+    _UPT_destroy(it->second.upt_info);
+  }
+  thread_infos.clear();
   clear_all_maps();
   if (proc_pid_mem_fd >= 0)
     close(proc_pid_mem_fd);
