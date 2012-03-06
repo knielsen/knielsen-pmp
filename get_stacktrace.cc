@@ -40,6 +40,7 @@ ptrace_all_threads(int pid)
     however loop again if they manage to spawn a new one in-between, and
     we will eventually get them all.
   */
+  seen_tids.clear();
   for (;;)
   {
     dir= opendir(buf);
@@ -129,23 +130,16 @@ puntrace_all()
 
 static vector<unw_word_t> backtrace;
 static void
-do_the_backtrace(int pid, unw_addr_space_t addr_space)
+do_the_backtrace(int pid, unw_addr_space_t addr_space, void *upt_info)
 {
-  void *upt_info= NULL;
   int err;
 
-  upt_info= _UPT_create(pid);
-  if (!upt_info)
-  {
-    fprintf(stderr, "_UPT_create(%d) failed.\n", pid);
-    goto err_exit;
-  }
   unw_cursor_t cursor;
   err= unw_init_remote(&cursor, addr_space, upt_info);
   if (err)
   {
     fprintf(stderr, "Error: unw_init_remote() returned %d\n", err);
-    goto err_exit;
+    return;
   }
 
   backtrace.clear();
@@ -166,10 +160,6 @@ do_the_backtrace(int pid, unw_addr_space_t addr_space)
     _UPT_get_proc_name(addr_space, *it, buf, sizeof(buf), &offp, upt_info);
     printf("ip = %lx <%s>+%d\n", (long) *it, buf, (long)offp);
   }
-
-err_exit:
-  if (upt_info)
-    _UPT_destroy(upt_info);
 }
 
 /*
@@ -316,6 +306,7 @@ main(int argc, char *argv[])
   unw_addr_space_t addr_space= NULL;
   int pid, err;
   unw_accessors_t my_accessors;
+  void *upt_info= NULL;
 
   if (argc != 2)
   {
@@ -345,21 +336,31 @@ main(int argc, char *argv[])
 
   find_readonly_maps(pid);
 
+  upt_info= _UPT_create(pid);
+  if (!upt_info)
+  {
+    fprintf(stderr, "_UPT_create(%d) failed.\n", pid);
+    goto err_exit;
+  }
+
   err= ptrace_all_threads(pid);
   if (!err)
   {
-    for (set<int>::iterator it= seen_tids.begin(); it != seen_tids.end(); ++it)
+    for (set<int>::iterator it= seen_tids.begin();
+         it != seen_tids.end();
+         ++it)
     {
       printf("\nThread: %d\n", *it);
-      do_the_backtrace(*it, addr_space);
+      do_the_backtrace(*it, addr_space, upt_info);
     }
   }
-
   puntrace_all();
 
   clear_non_read_only_maps();
 
 err_exit:
+  if (upt_info)
+    _UPT_destroy(upt_info);
   clear_all_maps();
   if (proc_pid_mem_fd >= 0)
     close(proc_pid_mem_fd);
