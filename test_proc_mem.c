@@ -7,6 +7,8 @@
   security issues (#define mem_write NULL).
 
       http://lkml.org/lkml/2006/3/10/224
+
+  UPDATE: writing seems to work on kernel 3.1.0 (Debian Wheezy).
 */
 
 #define _XOPEN_SOURCE 500
