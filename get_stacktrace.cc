@@ -69,7 +69,7 @@ ptrace_all_threads(int pid)
       break;
 
     /* Now ptrace all the threads found... */
-    for (set<int>::iterator it= new_tids.begin(); it != new_tids.end(); it++)
+    for (set<int>::iterator it= new_tids.begin(); it != new_tids.end(); ++it)
     {
       long perr= ptrace(PTRACE_ATTACH, *it, NULL, NULL);
       if (perr)
@@ -88,7 +88,7 @@ ptrace_all_threads(int pid)
     }
 
     /* ... and wait for them to stop. */
-    for (set<int>::iterator it= new_tids.begin(); it != new_tids.end(); it++)
+    for (set<int>::iterator it= new_tids.begin(); it != new_tids.end(); ++it)
     {
       if (!seen_tids.count(*it))
         continue;                     /* Exited before we could ptrace() it */
@@ -118,7 +118,7 @@ err_exit:
 static void
 puntrace_all()
 {
-  for (set<int>::iterator it= seen_tids.begin(); it != seen_tids.end(); it++)
+  for (set<int>::iterator it= seen_tids.begin(); it != seen_tids.end(); ++it)
   {
     long perr= ptrace(PTRACE_DETACH, *it, NULL, NULL);
     if (perr)
@@ -158,7 +158,7 @@ do_the_backtrace(int pid, unw_addr_space_t addr_space)
 
   for (vector<unw_word_t>::iterator it= backtrace.begin();
        it != backtrace.end();
-       it++)
+       ++it)
   {
     char buf[1024];
     unw_word_t offp= 0;
@@ -170,6 +170,44 @@ do_the_backtrace(int pid, unw_addr_space_t addr_space)
 err_exit:
   if (upt_info)
     _UPT_destroy(upt_info);
+}
+
+/*
+  Read and parse /proc/<pid>/maps to find any read-only maps.
+  For such maps, we can cache reads across multiple stacktraces.
+  Errors here are non-fatal; we will just be unable to cache
+  read-only maps.
+*/
+struct read_only_map { unsigned long start, end; };
+static vector<read_only_map> read_only_maps;
+static void
+find_readonly_maps(int pid)
+{
+  char buf[32];
+  sprintf(buf, "/proc/%d/maps", pid);
+  FILE *f = fopen(buf, "r");
+  if (!f)
+  {
+    fprintf(stderr, "Warning: unable to open %s: %d: %s\n",
+            errno, strerror(errno));
+    return;
+  }
+  for (;;)
+  {
+    struct read_only_map entry;
+    char perms[5];
+    int res = fscanf(f, "%lx-%lx %4[rwxsp-] %*[^\n]",
+                     &entry.start, &entry.end, perms);
+    if (res != 3)
+      break;
+    if (perms[0] != '\0' && perms[1] == '-')
+    {
+      /* A read-only map. */
+      //fprintf(stderr, "Found read-only map: 0x%lx - 0x%lx\n", entry.start, entry.end);
+      read_only_maps.push_back(entry);
+    }
+  }
+  fclose(f);
 }
 
 static int (*orig_access_mem)(unw_addr_space_t, unw_word_t, unw_word_t *,
@@ -227,6 +265,51 @@ my_access_mem(unw_addr_space_t as, unw_word_t addr, unw_word_t *valp,
   return 0;
 }
 
+static void
+clear_non_read_only_maps()
+{
+  for (map<unw_word_t, unsigned char *>::iterator it= cached_reads.begin();
+       it != cached_reads.end();
+       )
+  {
+    unw_word_t base_addr= it->first;
+    bool read_only= false;
+    for (vector<read_only_map>::iterator it2= read_only_maps.begin();
+         it2 != read_only_maps.end();
+         ++it2)
+    {
+      if (it2->start <= base_addr && base_addr < it2->end)
+      {
+        read_only= true;
+        break;
+      }
+    }
+    if (!read_only)
+    {
+      /* It was not a read-only map, so delete it. */
+      //fprintf(stderr, "Deleting non-read-only cached block %lx\n", it->first);
+      delete [] it->second;
+      cached_reads.erase(it++);
+    }
+    else
+    {
+      //fprintf(stderr, "Keeping read-only cached block %lx\n", it->first);
+      ++it;
+    }
+  }
+}
+
+static void
+clear_all_maps()
+{
+  for (map<unw_word_t, unsigned char *>::iterator it= cached_reads.begin();
+       it != cached_reads.end();
+       cached_reads.erase(it++))
+  {
+    delete [] it->second;
+  }
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -260,10 +343,12 @@ main(int argc, char *argv[])
     goto err_exit;
   }
 
+  find_readonly_maps(pid);
+
   err= ptrace_all_threads(pid);
   if (!err)
   {
-    for (set<int>::iterator it= seen_tids.begin(); it != seen_tids.end(); it++)
+    for (set<int>::iterator it= seen_tids.begin(); it != seen_tids.end(); ++it)
     {
       printf("\nThread: %d\n", *it);
       do_the_backtrace(*it, addr_space);
@@ -272,7 +357,10 @@ main(int argc, char *argv[])
 
   puntrace_all();
 
+  clear_non_read_only_maps();
+
 err_exit:
+  clear_all_maps();
   if (proc_pid_mem_fd >= 0)
     close(proc_pid_mem_fd);
   if (addr_space)
