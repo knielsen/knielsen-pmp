@@ -15,6 +15,7 @@
 #include <set>
 #include <map>
 #include <vector>
+#include <string>
 using namespace std;
 
 #include <libunwind.h>
@@ -294,6 +295,11 @@ struct thread_info {
   vector<unw_word_t> backtrace;
 };
 static map<int, thread_info> thread_infos;
+struct symbol_info {
+  string name;
+  unw_word_t offp;
+};
+static map<unw_word_t, symbol_info> symbol_infos;
 
 int
 main(int argc, char *argv[])
@@ -403,18 +409,28 @@ main(int argc, char *argv[])
            frame != it->second.backtrace.end();
            ++frame)
       {
-        char buf[1024];
-        unw_word_t offp= 0;
-        strcpy(buf, "");    /* So we just print empty on error */
-        _UPT_get_proc_name(addr_space, *frame, buf, sizeof(buf), &offp,
-                           it->second.upt_info);
-        printf("ip = %lx <%s>+%d\n", (long) *frame, buf, (long)offp);
+        map<unw_word_t, symbol_info>::iterator sym;
+        sym = symbol_infos.find(*frame);
+        if (sym == symbol_infos.end())
+        {
+          char buf[1024];
+          struct symbol_info info;
+          strcpy(buf, "??");
+          _UPT_get_proc_name(addr_space, *frame, buf, sizeof(buf), &info.offp,
+                             it->second.upt_info);
+          info.name= buf;
+          sym= symbol_infos.insert
+            (pair<unw_word_t, symbol_info>(*frame, info)).first;
+        }
+
+        printf("ip = %lx <%s>+%d\n", (long) *frame, sym->second.name.c_str(),
+               (unsigned long)sym->second.offp);
       }
     }
 
     /*
-      Drop from cache any reads from non-read-only maps, as they may well change
-      before the next stack traces.
+      Drop from cache any reads from non-read-only maps, as they may well
+      change before the next stack traces.
     */
     clear_non_read_only_maps();
   }
