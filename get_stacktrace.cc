@@ -5,6 +5,7 @@
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/user.h>
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <dirent.h>
@@ -21,9 +22,18 @@ using namespace std;
 #include <libunwind.h>
 #include <libunwind-ptrace.h>
 
+#define MAX_FRAMES 20
+
 #define READ_PAGE_SIZE 4096
 #define READ_PAGE_SIZE_MASK ~((unw_word_t)4096-1)
 
+
+static int cached_mem_read(unw_word_t addr, unw_word_t *valp);
+
+
+static enum {
+  BACK_LIBUNWIND, BACK_FRAME_POINTER
+} backtrace_method= BACK_LIBUNWIND;
 static set<int> seen_tids;
 
 static int
@@ -152,6 +162,55 @@ do_the_backtrace(unw_addr_space_t addr_space, void *upt_info,
   } while (unw_step(&cursor) > 0);
 }
 
+
+/*
+  If we have -fno-omit-frame-pointer, we can obtain a backtrace simply
+  by walking the frame pointer chain.
+*/
+static void
+frame_pointer_backtrace(pid_t thread, vector<unw_word_t> *backtrace, int limit)
+{
+  /*
+    When using frame pointer, %rbp always points to the current stack frame.
+    More precisely, %rbp points to the location where old frame pointer is
+    stored, and (%rbp+8) holds the return address.
+
+    So to unwind the stack, we first obtain %rip and %rbp using ptrace - and
+    %rip is then the start of the backtrace. Then we loop, loading (%rbp)
+    and (%rbp+8) to get new values of %rbp and %rip.
+  */
+
+  backtrace->clear();
+  struct user_regs_struct regs;
+  if (ptrace(PTRACE_GETREGS, thread, 0, &regs))
+  {
+    fprintf(stderr, "Warning: Failed to read regs from thread: %d: %s\n",
+            errno, strerror(errno));
+    return;
+  }
+
+  unw_word_t rip= regs.rip;
+  unw_word_t rbp= regs.rbp;
+  for (;;)
+  {
+    backtrace->push_back(rip);
+    if (!rbp || --limit <- 0)
+      break;
+    unw_word_t new_rbp, new_rip;
+    if (cached_mem_read(rbp, &new_rbp) ||
+        cached_mem_read(rbp+sizeof(unw_word_t), &new_rip))
+    {
+      /*
+        We can't read from the supposed stack frame - so we probably
+        reached the end (or maybe we got off track somehow).
+      */
+      break;
+    }
+    rbp= new_rbp;
+    rip= new_rip;
+  }
+}
+
 /*
   Read and parse /proc/<pid>/maps to find any read-only maps.
   For such maps, we can cache reads across multiple stacktraces.
@@ -210,7 +269,12 @@ my_access_mem(unw_addr_space_t as, unw_word_t addr, unw_word_t *valp,
 {
   if (write)
     return (*orig_access_mem)(as, addr, valp, write, arg);
+  return cached_mem_read(addr, valp);
+}
 
+static int
+cached_mem_read(unw_word_t addr, unw_word_t *valp)
+{
   unw_word_t base_addr= addr & READ_PAGE_SIZE_MASK;
   const map<unw_word_t, unsigned char *>::iterator it=
     cached_reads.find(base_addr);
@@ -310,9 +374,22 @@ main(int argc, char *argv[])
   void *upt_info= NULL;
   struct thread_info new_entry;
 
+  char **p= &argv[1];
+  while (argc > 2)
+  {
+    if (0 == strcmp(*p, "--framepointer"))
+      backtrace_method= BACK_FRAME_POINTER;
+    else if (0 == strcmp(*p, "--libunwind"))
+      backtrace_method= BACK_LIBUNWIND;
+    else
+      break;
+    ++p;
+    --argc;
+  }
   if (argc != 2)
   {
-    fprintf(stderr, "Usage: %s <pid>\n", argv[0]);
+    fprintf(stderr, "Usage: %s [--libunwind | --framepointer] <pid>\n",
+            argv[0]);
     exit(1);
   }
 
@@ -326,7 +403,7 @@ main(int argc, char *argv[])
     goto err_exit;
   }
 
-  pid= atoi(argv[1]);
+  pid= atoi(*p);
   char buf[30];
   sprintf(buf, "/proc/%d/mem", pid);
   proc_pid_mem_fd = open(buf, O_RDONLY, 0);
@@ -338,7 +415,7 @@ main(int argc, char *argv[])
 
   find_readonly_maps(pid);
 
-  for (int i= 0; i < 10; ++i)
+  for (int i= 0; i < 1; ++i)
   {
     map<int, thread_info> prev_infos= thread_infos;
     thread_infos.clear();
@@ -382,7 +459,18 @@ main(int argc, char *argv[])
         thr= thread_infos.insert(pair<int, thread_info>(pid, old->second)).first;
         prev_infos.erase(old);
       }
-      do_the_backtrace(addr_space, thr->second.upt_info, &thr->second.backtrace);
+      switch (backtrace_method)
+      {
+      case BACK_LIBUNWIND:
+        do_the_backtrace(addr_space, thr->second.upt_info,
+                         &thr->second.backtrace);
+        break;
+      case BACK_FRAME_POINTER:
+        frame_pointer_backtrace(pid, &thr->second.backtrace, MAX_FRAMES);
+        break;
+      default:
+        abort();
+      }
     }
 
     puntrace_all();
@@ -399,7 +487,6 @@ main(int argc, char *argv[])
     prev_infos.clear();
 
     /* Now resolve symbols and print each backtrace. */
-    /* ToDo: cache symbol lookups. */
     for (map<int, thread_info>::iterator it= thread_infos.begin();
          it != thread_infos.end();
          ++it)
