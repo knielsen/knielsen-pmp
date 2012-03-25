@@ -12,11 +12,14 @@
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 #include <set>
 #include <map>
 #include <vector>
 #include <string>
+#include <algorithm>
+
 using namespace std;
 
 #include <libunwind.h>
@@ -31,9 +34,28 @@ using namespace std;
 static int cached_mem_read(unw_word_t addr, unw_word_t *valp);
 
 
+static int probe_freq= 1;
+static int probe_max= 1;
 static enum {
   BACK_LIBUNWIND, BACK_FRAME_POINTER
 } backtrace_method= BACK_LIBUNWIND;
+
+
+static double
+get_current_time()
+{
+  struct timespec t;
+  int res= clock_gettime(CLOCK_REALTIME, &t);
+  if (res)
+  {
+    fprintf(stderr, "Error: clock_gettime() failed: %d: %s\n",
+            errno, strerror(errno));
+    exit(1);
+  }
+  return (double)t.tv_sec + 1e-9*(double)t.tv_nsec;
+}
+
+
 static set<int> seen_tids;
 
 static int
@@ -141,7 +163,7 @@ puntrace_all()
 
 static void
 do_the_backtrace(unw_addr_space_t addr_space, void *upt_info,
-                 vector<unw_word_t> *backtrace)
+                 vector<unw_word_t> *backtrace, int limit)
 {
   int err;
 
@@ -159,7 +181,7 @@ do_the_backtrace(unw_addr_space_t addr_space, void *upt_info,
     unw_word_t ip= 0;
     unw_get_reg(&cursor, UNW_REG_IP, &ip);
     backtrace->push_back(ip);
-  } while (unw_step(&cursor) > 0);
+  } while (--limit > 0 && unw_step(&cursor) > 0);
 }
 
 
@@ -293,8 +315,13 @@ cached_mem_read(unw_word_t addr, unw_word_t *valp)
   if (res != READ_PAGE_SIZE)
   {
     if (res < 0)
-      fprintf(stderr, "Error reading from target process memory: %d: %s\n",
-              errno, strerror(errno));
+    {
+/*
+      fprintf(stderr,
+              "Error reading from target process memory %p: %d: %s\n",
+              page, errno, strerror(errno));
+*/
+    }
     else
       fprintf(stderr, "Short read reading from target process memory: "
               "asked for %u bytes but got %u\n", READ_PAGE_SIZE,
@@ -354,6 +381,14 @@ clear_all_maps()
   }
 }
 
+static struct my_stack_compare {
+  typedef pair<string, int> T;
+  bool operator() (T i, T j)
+  {
+    return i.second < j.second || (i.second == j.second && i.first < j.first);
+  }
+} my_stack_comparer;
+
 struct thread_info {
   void * upt_info;
   vector<unw_word_t> backtrace;
@@ -365,6 +400,7 @@ struct symbol_info {
 };
 static map<unw_word_t, symbol_info> symbol_infos;
 
+static map<string, int> trace_map;
 int
 main(int argc, char *argv[])
 {
@@ -373,6 +409,8 @@ main(int argc, char *argv[])
   unw_accessors_t my_accessors;
   void *upt_info= NULL;
   struct thread_info new_entry;
+  double start_time= get_current_time(), suspend_time=0;
+  int total_backtraces= 0;
 
   char **p= &argv[1];
   while (argc > 2)
@@ -381,6 +419,17 @@ main(int argc, char *argv[])
       backtrace_method= BACK_FRAME_POINTER;
     else if (0 == strcmp(*p, "--libunwind"))
       backtrace_method= BACK_LIBUNWIND;
+    else if (0 == strncmp(*p, "--freq=", 7))
+    {
+      probe_freq= atoi(&(*p)[7]);
+      if (probe_freq <= 0)
+      {
+        fprintf(stderr, "Error: --freq must be a number > 0\n");
+        exit(1);
+      }
+    }
+    else if (0 == strncmp(*p, "--max=", 6))
+      probe_max= atoi(&(*p)[6]);
     else
       break;
     ++p;
@@ -388,7 +437,8 @@ main(int argc, char *argv[])
   }
   if (argc != 2)
   {
-    fprintf(stderr, "Usage: %s [--libunwind | --framepointer] <pid>\n",
+    fprintf(stderr, "Usage: %s [--libunwind | --framepointer] "
+            "[--max=N] [--freq=N] <pid>\n",
             argv[0]);
     exit(1);
   }
@@ -415,7 +465,7 @@ main(int argc, char *argv[])
 
   find_readonly_maps(pid);
 
-  for (int i= 0; i < 1; ++i)
+  for (int i= 0; probe_max == 0 || i < probe_max; ++i)
   {
     map<int, thread_info> prev_infos= thread_infos;
     thread_infos.clear();
@@ -427,6 +477,7 @@ main(int argc, char *argv[])
       possible, and defer as much as possible to afterwards.
     */
 
+    double cur_time= get_current_time();
     err= ptrace_all_threads(pid);
     if (err)
     {
@@ -463,7 +514,7 @@ main(int argc, char *argv[])
       {
       case BACK_LIBUNWIND:
         do_the_backtrace(addr_space, thr->second.upt_info,
-                         &thr->second.backtrace);
+                         &thr->second.backtrace, MAX_FRAMES);
         break;
       case BACK_FRAME_POINTER:
         frame_pointer_backtrace(pid, &thr->second.backtrace, MAX_FRAMES);
@@ -474,6 +525,7 @@ main(int argc, char *argv[])
     }
 
     puntrace_all();
+    suspend_time+= get_current_time() - cur_time;
 
     /* Now target process is release; do rest of processing. */
 
@@ -491,7 +543,10 @@ main(int argc, char *argv[])
          it != thread_infos.end();
          ++it)
     {
-      printf("\nThread: %d\n", it->first);
+      if (probe_max == 1)
+        printf("\nThread: %d\n", it->first);
+      string key;
+      int sep= 0;
       for (vector<unw_word_t>::iterator frame= it->second.backtrace.begin();
            frame != it->second.backtrace.end();
            ++frame)
@@ -510,9 +565,19 @@ main(int argc, char *argv[])
             (pair<unw_word_t, symbol_info>(*frame, info)).first;
         }
 
-        printf("ip = %lx <%s>+%d\n", (long) *frame, sym->second.name.c_str(),
-               (unsigned long)sym->second.offp);
+        if (probe_max == 1)
+          printf("ip = %lx <%s>+%d\n", (long) *frame, sym->second.name.c_str(),
+                 (unsigned long)sym->second.offp);
+        else
+        {
+          if (sep)
+            key+= ":";
+          key+= sym->second.name;
+          sep= 1;
+        }
       }
+      ++(trace_map.insert(pair<string,int>(key, 0)).first->second);
+      ++total_backtraces;
     }
 
     /*
@@ -520,6 +585,49 @@ main(int argc, char *argv[])
       change before the next stack traces.
     */
     clear_non_read_only_maps();
+
+    if ((i + 1) % probe_freq == 0)
+    {
+      vector< pair<string, int> > list(trace_map.begin(), trace_map.end());
+      std::sort(list.begin(), list.end(), my_stack_comparer);
+      printf("\n\n");
+      int total= list.size();
+      for (vector<pair<string, int> >::iterator it= list.begin();
+           it != list.end();
+           ++it)
+      {
+        if (--total < 20)
+            printf("  %5d  %5.2f%%  %s\n", it->second,
+                   (double)it->second/(double)total_backtraces*100,
+                   it->first.c_str());
+      }
+
+      double total_time= get_current_time() - start_time;
+      printf("Target process suspended %5.2f%% of %.2f seconds\n",
+             suspend_time/total_time*100, total_time);
+    }
+
+    if (i + 1 == probe_max)
+      break;
+
+    /* Sleep a short while until next probe. */
+    struct timespec req, rem;
+    if (probe_freq <= 1)
+    {
+      req.tv_sec= 1;
+      req.tv_nsec= 0;
+    }
+    else
+    {
+      req.tv_sec= 0;
+      req.tv_nsec= (long)1000000000/(long)probe_freq;
+    }
+    for (;;)
+    {
+      if (0 == nanosleep(&req, &rem))
+        break;
+      req= rem;
+    }
   }
 
 err_exit:
