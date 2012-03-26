@@ -452,6 +452,12 @@ main(int argc, char *argv[])
     fprintf(stderr, "unw_create_addr_space() failed.\n");
     goto err_exit;
   }
+  err= unw_set_caching_policy(addr_space, UNW_CACHE_GLOBAL);
+  if (err)
+  {
+    fprintf(stderr, "unw_set_caching_policy() failed: %d.\n", err);
+    goto err_exit;
+  }
 
   pid= atoi(*p);
   char buf[30];
